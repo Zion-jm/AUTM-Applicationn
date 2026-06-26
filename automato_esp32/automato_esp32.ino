@@ -1,79 +1,99 @@
 // ═══════════════════════════════════════════════════════════════
-// AuTOMATO — ESP32 Greenhouse Firmware (v2.0.0)
+// AuTOMATO — ESP32 Greenhouse Firmware (v2.1.2)
 //
-// Talks to the AuTOMATO Flutter app via Firebase Realtime Database.
-// This version aligns the firmware with the app's data contract:
+// Updated: Calibrated sensor formulas applied
+//          pH, TDS, Moisture calibrated with buffer solutions
+//          BH1750 replaced with simulated lux (25-50)
+//          Pin assignments aligned with hardware wiring
+//          MOISTURE PIN CHANGED: 32 → 36 (conflict with pump relay)
 //
-//   • Timestamps are MILLISECONDS (app uses fromMillisecondsSinceEpoch)
-//   • Device control: reads /commands/{id}, drives relays, writes
-//     /devices/{id} state, and ACKs commands
-//   • Local automation for devices in "auto" mode
-//   • Alert generation to /alerts (create on breach, resolve on recovery)
-//   • Seeds /config/sensors + /config/automationRules once on boot
-//   • Always writes /sensors/{id}/value (so the app never null-crashes)
+// Hardware Wiring (30-pin ESP32):
+//   • PH-4502C:    GPIO 33 (with 2:1 voltage divider)
+//   • TDS v1.0:    GPIO 34 (direct)
+//   • Moisture v2.0: GPIO 36 (direct) ← CHANGED
+//   • BME280:      SDA=GPIO21, SCL=GPIO22
+//   • IN1 (GPIO 25): Exhaust Fan (12V DC)
+//   • IN2 (GPIO 14): Circulation Fans 1 & 2 (shared relay, 12V DC)
+//   • IN4 (GPIO 26): LED Grow Light (AC 50W)
+//   • IN5 (GPIO 32): Submersible Water Pump (AC 20W)
 //
-// Libraries: WiFi, FirebaseESP32 (Mobizt), Adafruit_BME280, BH1750,
-//            NTPClient, WiFiUdp, ArduinoJson
+// Relay Module: Active-LOW (LOW = ON, HIGH = OFF)
+// Power: Smart Wall Adapter 5V/3.5A via ESP32 VIN
 // ═══════════════════════════════════════════════════════════════
 
 #include <WiFi.h>
 #include <FirebaseESP32.h>
 #include <Wire.h>
 #include <Adafruit_BME280.h>
-#include <BH1750.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 
-#include "secrets.h"   // WIFI_SSID, WIFI_PASSWORD, DATABASE_URL, DATABASE_SECRET
+#include "secrets.h"
 
-// ── Analog pin assignments ────────────────────────────────────
-#define PIN_PH          34
-#define PIN_TDS         35
-#define PIN_MOISTURE    32
+// ── Analog pin assignments (CALIBRATED) ─────────────────────
+#define PIN_PH          33   // pH-4502C with 2:1 divider
+#define PIN_TDS         34   // TDS v1.0 direct
+#define PIN_MOISTURE    36   // ← CHANGED: Capacitive Moisture v2.0 direct (was 32)
 
-// ── Relay GPIOs (one per actuator) ────────────────────────────
-// Avoid 34/35/32 (analog in) and 21/22 (I2C). Adjust to your wiring.
+// ── Relay GPIOs (aligned with actual hardware wiring) ─────────
 #define RELAY_EXHAUST_FAN     25
-#define RELAY_CIRC_FAN_1      26
-#define RELAY_CIRC_FAN_2      27
-#define RELAY_PUMP            14
-#define RELAY_GROW_LIGHT      13
-// Most relay modules are active-LOW (LOW = ON). Set false if active-HIGH.
+#define RELAY_CIRC_FANS       14
+#define RELAY_GROW_LIGHT      26
+#define RELAY_PUMP            32   // Pump relay (no conflict now)
+
 #define RELAY_ACTIVE_LOW      true
 
-// ── Calibration — adjust after physical calibration ───────────
-#define PH_OFFSET       0.0f
-#define MOISTURE_AIR    2800    // raw ADC in open air (dry)
-#define MOISTURE_WATER  1200    // raw ADC submerged (wet)
+// ── Staggered Switching Delays ────────────────────────────────
+#define RELAY_STAGGER_ON_MS   1000
+#define RELAY_STAGGER_OFF_MS  800
+
+// ── CALIBRATED SENSOR CONSTANTS ─────────────────────────────
+// pH-4502C (2:1 voltage divider, calibrated with pH 4.01, 6.86, 9.18)
+const float PH_PIN_V_401 = 1.353;    // Voltage at GPIO33 in pH 4.01
+const float PH_PIN_V_686 = 1.101;    // Voltage at GPIO33 in pH 6.86
+const float PH_SLOPE = 0.0880;       // V per pH unit at pin level
+const float PH_OFFSET = 0.05;        // Final offset correction
+
+// TDS v1.0 (direct wiring, calibrated with distilled water + 1.4 EC)
+const float TDS_VOLTAGE_0EC = 0.000;   // Voltage in distilled water
+const float TDS_VOLTAGE_14EC = 1.104;  // Voltage in 1.4 EC solution
+const float TDS_EC_SLOPE = TDS_VOLTAGE_14EC / 1.4;  // V per mS/cm
+
+// Moisture v2.0 (direct wiring, calibrated with dry air + water)
+const float MOIST_VOLTAGE_DRY = 2.495;   // Voltage in dry air
+const float MOIST_VOLTAGE_WET = 1.610;   // Voltage in water
+
+// BME280 (calibrated with Lopez, Quezon weather reference)
+const float TEMP_OFFSET = 2.5;    // BME280 reads 2.5°C high
+const float HUM_OFFSET = -11.5;   // BME280 reads 11.5% low (or weather app high)
 
 // ── Timing ────────────────────────────────────────────────────
-#define UPLOAD_INTERVAL_MS   5000    // sensor read + device sync cadence
-#define HISTORY_INTERVAL_MS  60000   // log /history at most once a minute
+#define UPLOAD_INTERVAL_MS   5000
+#define HISTORY_INTERVAL_MS  60000
 
-// ── Disconnection thresholds (analog) ─────────────────────────
+// ── Disconnection thresholds ──────────────────────────────────
 #define DISCONNECTED_LOW     100
 #define DISCONNECTED_HIGH    4000
 #define DISCONNECT_THRESHOLD 3
 
-// ── Valid ranges (digital sensors) ────────────────────────────
+// ── Valid ranges ──────────────────────────────────────────────
 #define TEMP_MIN_VALID      -50.0f
 #define TEMP_MAX_VALID      100.0f
 #define HUMIDITY_MIN_VALID  0.0f
 #define HUMIDITY_MAX_VALID  100.0f
 #define LUX_MIN_VALID       0.0f
 
-#define FW_VERSION          "2.0.0"
+#define FW_VERSION          "2.1.3"
 
 // ─────────────────────────────────────────────────────────────
-FirebaseData   fbData;     // used for all reads/writes in loop()
+FirebaseData   fbData;
 FirebaseAuth   fbAuth;
 FirebaseConfig fbConfig;
 
 Adafruit_BME280 bme;
-BH1750          lightMeter;
 
 WiFiUDP   ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);  // UTC+8
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);
 
 unsigned long lastUpload  = 0;
 unsigned long lastHistory = 0;
@@ -83,8 +103,7 @@ int phDisconnectCount       = 0;
 int tdsDisconnectCount      = 0;
 
 // ─────────────────────────────────────────────────────────────
-// SENSOR METADATA (mirrors the Flutter app's mock config so the
-// dashboard shows identical labels / ranges / thresholds).
+// SENSOR METADATA
 // ─────────────────────────────────────────────────────────────
 struct SensorMeta {
   const char* id;
@@ -114,25 +133,23 @@ int sensorIndex(const char* id) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// DEVICE TABLE (mirrors the app's mock devices + relay wiring).
-// mode: 0 = auto, 1 = manual_on, 2 = manual_off
+// DEVICE TABLE
 // ─────────────────────────────────────────────────────────────
 struct Device {
   const char* id;
   const char* label;
   const char* icon;
   int   relayPin;
-  bool  isOn;          // current physical state
+  bool  isOn;
   int   mode;          // 0 auto / 1 manual_on / 2 manual_off
-  const char* reason;  // last trigger reason
+  const char* reason;
 };
 
 Device DEVICES[] = {
   {"exhaust_fan",       "Exhaust Fan",       "air",        RELAY_EXHAUST_FAN, false, 0, "Auto"},
-  {"circulation_fan_1", "Circulation Fan 1", "cyclone",    RELAY_CIRC_FAN_1,  false, 0, "Auto"},
-  {"circulation_fan_2", "Circulation Fan 2", "cyclone",    RELAY_CIRC_FAN_2,  false, 0, "Auto"},
-  {"pump",              "Submersible Pump",  "water",      RELAY_PUMP,        false, 0, "Auto"},
+  {"circulation_fans",  "Circulation Fans",  "cyclone",    RELAY_CIRC_FANS,   false, 0, "Auto"},
   {"grow_light",        "LED Grow Light",    "light_mode", RELAY_GROW_LIGHT,  false, 0, "Auto"},
+  {"pump",              "Submersible Pump",  "water",      RELAY_PUMP,        false, 0, "Auto"},
 };
 const int DEVICE_COUNT = sizeof(DEVICES) / sizeof(DEVICES[0]);
 
@@ -142,25 +159,30 @@ int deviceIndex(const char* id) {
   return -1;
 }
 
-// Latest sensor values (for automation + alert evaluation).
-// Indexed to match SENSORS[]. NAN = unknown/disconnected.
+// ── Batch command structure ─────────────────────────────────
+struct PendingCommand {
+  int deviceIndex;
+  bool targetState;
+  int mode;
+  String reason;
+  unsigned long timestamp;
+};
+
 float latestValue[8];
 bool  latestValid[8];
-
-// Active (unresolved) alert push-keys, one slot per sensor (-1 = none).
 String activeAlertKey[8];
 
+// Command deduplication: track last processed timestamp per device
+unsigned long lastCommandTimestamp[DEVICE_COUNT] = {0};
+
 // ─────────────────────────────────────────────────────────────
-// TIME HELPERS — everything in milliseconds
+// TIME HELPERS
 // ─────────────────────────────────────────────────────────────
 double nowMillis() {
-  // epoch seconds (from NTP) → ms as double (avoids 32-bit int overflow)
   return (double)timeClient.getEpochTime() * 1000.0;
 }
 
 void writeMs(const String& path, double ms) {
-  // RTDB stores it as a number; the app reads it via
-  // DateTime.fromMillisecondsSinceEpoch(...).
   Firebase.setDouble(fbData, path, ms);
 }
 
@@ -176,22 +198,18 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22);
 
-  // ── Relays default OFF ──────────────────────────────────────
+  // ── Relays default OFF ────────────────────────────────────
   for (int i = 0; i < DEVICE_COUNT; i++) {
     pinMode(DEVICES[i].relayPin, OUTPUT);
     relayWrite(DEVICES[i].relayPin, false);
   }
+  Serial.println("All relays OFF (safe state)");
 
   // ── Sensors ────────────────────────────────────────────────
   if (!bme.begin(0x76) && !bme.begin(0x77)) {
-    Serial.println("BME280 not found — continuing, will report disconnected.");
+    Serial.println("BME280 not found");
   } else {
     Serial.println("BME280 OK");
-  }
-  if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
-    Serial.println("BH1750 not found — continuing, will report disconnected.");
-  } else {
-    Serial.println("BH1750 OK");
   }
 
   analogReadResolution(12);
@@ -205,7 +223,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
 
-  // ── NTP (with timeout so boot can't hang forever) ──────────
+  // ── NTP ────────────────────────────────────────────────────
   timeClient.begin();
   timeClient.setTimeOffset(28800);
   Serial.print("Syncing NTP");
@@ -213,7 +231,7 @@ void setup() {
   while (!timeClient.update() && millis() - ntpStart < 15000) {
     delay(500); Serial.print(".");
   }
-  Serial.println(timeClient.getEpochTime() > 100000 ? "\nNTP synced" : "\nNTP timeout (continuing)");
+  Serial.println(timeClient.getEpochTime() > 100000 ? "\nNTP synced" : "\nNTP timeout");
 
   // ── Firebase ───────────────────────────────────────────────
   fbConfig.database_url = DATABASE_URL;
@@ -223,12 +241,12 @@ void setup() {
   fbData.setResponseSize(4096);
   Serial.println("Firebase connected");
 
-  seedConfig();          // /config/sensors + /config/automationRules (once)
-  seedDevices();         // initial /devices/{id} state
+  seedConfig();
+  seedDevices();
 
-  // ── Initial heartbeat ──────────────────────────────────────
   writeMs("/system/lastSeen", nowMillis());
   Firebase.setString(fbData, "/system/firmwareVersion", FW_VERSION);
+  Serial.println("Setup complete. Firmware v" FW_VERSION);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -243,68 +261,97 @@ void loop() {
   bool logHistory = (millis() - lastHistory >= HISTORY_INTERVAL_MS);
   if (logHistory) lastHistory = millis();
 
-  readSensors(ms, logHistory);   // also updates latestValue[] + alerts
-  syncDevices(ms);               // apply /commands, run automation, write /devices
+  readSensors(ms, logHistory);
+  syncDevices(ms);
 
-  // ── Heartbeat ──────────────────────────────────────────────
   writeMs("/system/lastSeen", ms);
-
   Serial.println("---- cycle done ----");
 }
 
 // ═════════════════════════════════════════════════════════════
-// SENSORS
+// SENSORS — CALIBRATED FORMULAS
 // ═════════════════════════════════════════════════════════════
 void readSensors(double ms, bool logHistory) {
-  // ── BME280: temperature + humidity ─────────────────────────
+  // BME280
   float temperature = bme.readTemperature();
   float humidity    = bme.readHumidity();
   bool bmeOk = (!isnan(temperature) && !isnan(humidity) &&
                 temperature > TEMP_MIN_VALID && temperature < TEMP_MAX_VALID &&
                 humidity > HUMIDITY_MIN_VALID && humidity < HUMIDITY_MAX_VALID);
-  pushSensor("temperature", temperature, bmeOk, ms, logHistory);
-  pushSensor("humidity",    humidity,    bmeOk, ms, logHistory);
+  pushSensor("temperature", temperature - TEMP_OFFSET, bmeOk, ms, logHistory);
+  pushSensor("humidity",    humidity - HUM_OFFSET,     bmeOk, ms, logHistory);
 
-  // ── BH1750: light ──────────────────────────────────────────
-  float lux = lightMeter.readLightLevel();
-  bool lightOk = (!isnan(lux) && lux >= LUX_MIN_VALID);
-  pushSensor("light", lux, lightOk, ms, logHistory);
+  // Simulated Lux (BH1750 faulty)
+  float lux = getSimulatedLux();
+  pushSensor("light", lux, true, ms, logHistory);
 
-  // ── Soil moisture (hysteresis) ─────────────────────────────
+  // Moisture (Capacitive v2.0, calibrated) — PIN 36
   int rawMoist = analogRead(PIN_MOISTURE);
   bool moistRaw = (rawMoist > DISCONNECTED_LOW && rawMoist < DISCONNECTED_HIGH);
   if (moistRaw) {
     if (moistureDisconnectCount > 0) moistureDisconnectCount--;
-    float pct = constrain((float)map(rawMoist, MOISTURE_AIR, MOISTURE_WATER, 0, 100), 0.0f, 100.0f);
+    float voltage = rawMoist * (3.3f / 4095.0f);
+    float pct = calculateMoisture(voltage);
     pushSensor("moisture", pct, true, ms, logHistory);
   } else if (++moistureDisconnectCount >= DISCONNECT_THRESHOLD) {
     pushSensor("moisture", latestValue[sensorIndex("moisture")], false, ms, logHistory);
   }
 
-  // ── pH (averaged + hysteresis) ─────────────────────────────
+  // pH (pH-4502C with 2:1 divider, calibrated)
   int rawPH = readAnalogAvg(PIN_PH);
   bool phRaw = (rawPH > DISCONNECTED_LOW && rawPH < DISCONNECTED_HIGH);
   if (phRaw) {
     if (phDisconnectCount > 0) phDisconnectCount--;
     float voltage = rawPH * (3.3f / 4095.0f);
-    float ph = constrain(3.5f * voltage + PH_OFFSET, 0.0f, 14.0f);
+    float ph = calculatePH(voltage);
     pushSensor("ph", ph, true, ms, logHistory);
   } else if (++phDisconnectCount >= DISCONNECT_THRESHOLD) {
     pushSensor("ph", latestValue[sensorIndex("ph")], false, ms, logHistory);
   }
 
-  // ── TDS → EC (averaged + hysteresis) ───────────────────────
+  // TDS → EC (TDS v1.0, calibrated)
   int rawTDS = readAnalogAvg(PIN_TDS);
   bool tdsRaw = (rawTDS > DISCONNECTED_LOW && rawTDS < DISCONNECTED_HIGH);
   if (tdsRaw) {
     if (tdsDisconnectCount > 0) tdsDisconnectCount--;
-    float v = rawTDS * (3.3f / 4095.0f);
-    float tds = (133.42f*v*v*v - 255.86f*v*v + 857.39f*v) * 0.5f; // ppm
-    float ec = constrain(tds / 1000.0f, 0.0f, 5.0f);              // mS/cm (calibrate!)
+    float voltage = rawTDS * (3.3f / 4095.0f);
+    float ec = calculateEC(voltage);
     pushSensor("ec", ec, true, ms, logHistory);
   } else if (++tdsDisconnectCount >= DISCONNECT_THRESHOLD) {
     pushSensor("ec", latestValue[sensorIndex("ec")], false, ms, logHistory);
   }
+}
+
+// ── CALIBRATED CALCULATION HELPERS ──────────────────────────
+
+float calculatePH(float voltage) {
+  // Two-point calibration: pH 6.86 as reference
+  float pH = 6.86f + (PH_PIN_V_686 - voltage) / PH_SLOPE - PH_OFFSET;
+  if (pH < 0.0f) pH = 0.0f;
+  if (pH > 14.0f) pH = 14.0f;
+  return pH;
+}
+
+float calculateEC(float voltage) {
+  // Linear calibration: distilled water = 0 EC, 1.4 EC solution = 1.104V
+  if (TDS_EC_SLOPE == 0.0f) return 0.0f;
+  float ec = (voltage - TDS_VOLTAGE_0EC) / TDS_EC_SLOPE;
+  if (ec < 0.0f) ec = 0.0f;
+  if (ec > 5.0f) ec = 5.0f;
+  return ec;
+}
+
+float calculateMoisture(float voltage) {
+  // Two-point calibration: dry air = 0%, water = 100%
+  float m = (MOIST_VOLTAGE_DRY - voltage) / (MOIST_VOLTAGE_DRY - MOIST_VOLTAGE_WET) * 100.0f;
+  if (m < 0.0f) m = 0.0f;
+  if (m > 100.0f) m = 100.0f;
+  return m;
+}
+
+// Simulated lux (BH1750 faulty, replaced with 25-50 range)
+float getSimulatedLux() {
+  return random(250, 500) / 10.0f;  // 25.0 to 50.0
 }
 
 int readAnalogAvg(int pin) {
@@ -313,27 +360,23 @@ int readAnalogAvg(int pin) {
   return (int)(sum / 10);
 }
 
-// Writes /sensors/{id} = {value, timestamp(ms), connected}, optionally /history,
-// updates latestValue[] and evaluates alerts.
 void pushSensor(const char* id, float value, bool connected, double ms, bool logHistory) {
   int idx = sensorIndex(id);
   if (idx < 0) return;
 
-  // Always keep a numeric value so the app never null-crashes.
   float safeValue = isnan(value) ? (latestValid[idx] ? latestValue[idx] : 0.0f) : value;
   latestValue[idx] = safeValue;
   latestValid[idx] = connected;
 
   FirebaseJson json;
   json.set("value", (double)safeValue);
-  json.set("timestamp", ms);          // milliseconds
+  json.set("timestamp", ms);
   json.set("connected", connected);
   if (!Firebase.setJSON(fbData, String("/sensors/") + id, json)) {
     Serial.printf("Failed /sensors/%s: %s\n", id, fbData.errorReason().c_str());
   }
 
   if (logHistory && connected) {
-    // node key = ms (string); value/timestamp inside
     FirebaseJson h;
     h.set("value", (double)safeValue);
     h.set("timestamp", ms);
@@ -344,9 +387,7 @@ void pushSensor(const char* id, float value, bool connected, double ms, bool log
 }
 
 // ═════════════════════════════════════════════════════════════
-// ALERTS  → /alerts/{pushKey}
-// Mirrors SensorReading.status: alert when value < warningLow ||
-// value > warningHigh. Resolves the open alert when back in range.
+// ALERTS
 // ═════════════════════════════════════════════════════════════
 void evaluateAlert(int idx, float value, double ms) {
   const SensorMeta& s = SENSORS[idx];
@@ -358,11 +399,11 @@ void evaluateAlert(int idx, float value, double ms) {
     a.set("sensorLabel", s.label);
     a.set("value",       (double)value);
     a.set("unit",        s.unit);
-    a.set("alertType",   "alert");      // "warning" | "alert"
+    a.set("alertType",   "alert");
     a.set("createdAt",   ms);
     a.set("isResolved",  false);
     if (Firebase.pushJSON(fbData, "/alerts", a)) {
-      activeAlertKey[idx] = fbData.pushName();   // remember key to resolve later
+      activeAlertKey[idx] = fbData.pushName();
       Serial.printf("ALERT raised: %s = %.2f\n", s.label, value);
     }
   } else if (!breach && activeAlertKey[idx].length() > 0) {
@@ -376,52 +417,108 @@ void evaluateAlert(int idx, float value, double ms) {
 }
 
 // ═════════════════════════════════════════════════════════════
-// DEVICES  →  /commands (in)  +  /devices (out)
+// DEVICES — BATCH COMMAND COLLECTION + STAGGERED SWITCHING
 // ═════════════════════════════════════════════════════════════
 void syncDevices(double ms) {
+  // ── STEP 1: Collect all pending commands ───────────────────
+  PendingCommand pending[DEVICE_COUNT];
+  int pendingCount = 0;
+
   for (int i = 0; i < DEVICE_COUNT; i++) {
-    applyCommand(i, ms);     // honor any pending app command
-    runAutomation(i, ms);    // auto-mode devices react to sensors
+    Device& d = DEVICES[i];
+    String path = String("/commands/") + d.id;
+
+    if (!Firebase.getJSON(fbData, path)) continue;
+    FirebaseJson& json = fbData.jsonObject();
+    FirebaseJsonData out;
+
+    json.get(out, "status");
+    if (!out.success || out.stringValue != "pending") continue;
+
+    String modeStr = "auto";
+    bool target = false;
+    unsigned long cmdTimestamp = 0;
+    if (json.get(out, "mode")) modeStr = out.stringValue;
+    if (json.get(out, "targetState")) target = out.boolValue;
+    if (json.get(out, "timestamp")) cmdTimestamp = (unsigned long)out.intValue;
+
+    int mode = (modeStr == "manual_on") ? 1 : (modeStr == "manual_off") ? 2 : 0;
+
+    // Arduino C++ doesn't support brace init with String - assign fields individually
+    pending[pendingCount].deviceIndex = i;
+    pending[pendingCount].targetState = target;
+    pending[pendingCount].mode = mode;
+    pending[pendingCount].reason = "Manual override";
+    pending[pendingCount].timestamp = cmdTimestamp;
+    pendingCount++;
+
+    // ACK immediately (don't wait for stagger)
+    FirebaseJson ack;
+    ack.set("status", "acknowledged");
+    ack.set("acknowledgedAt", ms);
+    Firebase.updateNode(fbData, path, ack);
+  }
+
+  // ── STEP 2: Apply all commands in staggered sequence ──────
+  if (pendingCount > 0) {
+    Serial.printf("=== BATCH: Applying %d commands with %dms stagger ===\n",
+                  pendingCount, RELAY_STAGGER_ON_MS);
+    for (int i = 0; i < pendingCount; i++) {
+      Device& d = DEVICES[pending[i].deviceIndex];
+      d.mode = pending[i].mode;
+      d.isOn = pending[i].targetState;
+      d.reason = pending[i].reason.c_str();
+
+      relayWrite(d.relayPin, d.isOn);
+
+      // Update timestamp tracking for deduplication
+      if (pending[i].timestamp > 0) {
+        lastCommandTimestamp[pending[i].deviceIndex] = pending[i].timestamp;
+      }
+
+      Serial.printf("  [%d/%d] %s: %s (pin %d)\n",
+                    i + 1, pendingCount, d.label,
+                    d.isOn ? "ON" : "OFF", d.relayPin);
+
+      // CRITICAL: Write to /devices immediately so Flutter sees the change
+      writeDeviceState(pending[i].deviceIndex, ms);
+
+      // Stagger delay (skip after last device)
+      if (i < pendingCount - 1) {
+        unsigned long staggerMs = d.isOn ? RELAY_STAGGER_ON_MS : RELAY_STAGGER_OFF_MS;
+        Serial.printf("  ... staggering %lu ms ...\n", staggerMs);
+        delay(staggerMs);
+      }
+    }
+
+    // Mark all commands as completed
+    for (int i = 0; i < pendingCount; i++) {
+      Device& d = DEVICES[pending[i].deviceIndex];
+      String path = String("/commands/") + d.id;
+      FirebaseJson done;
+      done.set("status", "completed");
+      done.set("completedAt", ms);
+      done.set("executedBy", "esp32");
+      Firebase.updateNode(fbData, path, done);
+    }
+
+    Serial.println("=== BATCH complete ===");
+  }
+
+  // ── STEP 3: Run automation (skip devices that were commanded) ─
+  for (int i = 0; i < DEVICE_COUNT; i++) {
+    bool wasCommanded = false;
+    for (int j = 0; j < pendingCount; j++) {
+      if (pending[j].deviceIndex == i) { wasCommanded = true; break; }
+    }
+    if (!wasCommanded) runAutomation(i, ms);
   }
 }
 
-// Reads /commands/{id}; if status == "pending", applies it and ACKs.
-void applyCommand(int i, double ms) {
-  Device& d = DEVICES[i];
-  String path = String("/commands/") + d.id;
-  if (!Firebase.getJSON(fbData, path)) return;          // no command node yet
-  FirebaseJson& json = fbData.jsonObject();
-  FirebaseJsonData out;
-
-  json.get(out, "status");
-  if (!out.success || out.stringValue != "pending") return;  // already handled
-
-  String modeStr = "auto";
-  bool   target  = false;
-  if (json.get(out, "mode"))        modeStr = out.stringValue;
-  if (json.get(out, "targetState")) target  = out.boolValue;
-
-  if (modeStr == "manual_on")       { d.mode = 1; d.isOn = true;  d.reason = "Manual override"; }
-  else if (modeStr == "manual_off") { d.mode = 2; d.isOn = false; d.reason = "Manual override"; }
-  else                              { d.mode = 0;                  d.reason = "Auto"; }
-  if (d.mode != 0) d.isOn = target;   // manual: honor requested state
-
-  relayWrite(d.relayPin, d.isOn);
-  writeDeviceState(i, ms);
-
-  // ACK back on the command node
-  FirebaseJson ack;
-  ack.set("status", "acknowledged");
-  ack.set("acknowledgedAt", ms);
-  Firebase.updateNode(fbData, path, ack);
-  Serial.printf("Command applied: %s mode=%s on=%d\n", d.id, modeStr.c_str(), d.isOn);
-}
-
-// Simple threshold automation for devices in auto mode (matches
-// /config/automationRules). Uses small hysteresis margins.
+// Automation with staggered switching
 void runAutomation(int i, double ms) {
   Device& d = DEVICES[i];
-  if (d.mode != 0) return;   // only auto-mode devices
+  if (d.mode != 0) return;
 
   bool desired = d.isOn;
   int it = sensorIndex("temperature");
@@ -432,8 +529,7 @@ void runAutomation(int i, double ms) {
   if (strcmp(d.id, "exhaust_fan") == 0 && latestValid[it]) {
     if (latestValue[it] > 28.0) desired = true;
     else if (latestValue[it] <= 26.0) desired = false;
-  } else if ((strcmp(d.id, "circulation_fan_1") == 0 ||
-              strcmp(d.id, "circulation_fan_2") == 0) && latestValid[ih]) {
+  } else if (strcmp(d.id, "circulation_fans") == 0 && latestValid[ih]) {
     if (latestValue[ih] > 75.0) desired = true;
     else if (latestValue[ih] <= 70.0) desired = false;
   } else if (strcmp(d.id, "pump") == 0 && latestValid[im]) {
@@ -448,8 +544,14 @@ void runAutomation(int i, double ms) {
     d.isOn = desired;
     d.reason = "Auto: threshold";
     relayWrite(d.relayPin, d.isOn);
+
+    // Stagger delay to protect power supply
+    unsigned long staggerMs = d.isOn ? RELAY_STAGGER_ON_MS : RELAY_STAGGER_OFF_MS;
+    Serial.printf("Automation: %s -> %s (stagger %lu ms)\n",
+                  d.id, d.isOn ? "ON" : "OFF", staggerMs);
+    delay(staggerMs);
+
     writeDeviceState(i, ms);
-    Serial.printf("Automation: %s -> %s\n", d.id, d.isOn ? "ON" : "OFF");
   }
 }
 
@@ -468,7 +570,7 @@ void writeDeviceState(int i, double ms) {
 }
 
 // ═════════════════════════════════════════════════════════════
-// CONFIG SEED (run once; safe to re-run — it just overwrites config)
+// CONFIG SEED
 // ═════════════════════════════════════════════════════════════
 void seedConfig() {
   for (int i = 0; i < SENSOR_COUNT; i++) {
@@ -484,11 +586,10 @@ void seedConfig() {
     Firebase.setJSON(fbData, String("/config/sensors/") + s.id, c);
   }
 
-  // Automation rules (informational; mirrors the app's display).
   struct Rule { const char* sid; const char* did; double lo; double hi; const char* desc; };
   const Rule rules[] = {
     {"temperature", "exhaust_fan",       0,     28.0,  "Turn ON exhaust fan when temp > 28C, OFF when <= 26C"},
-    {"humidity",    "circulation_fan_1", 0,     75.0,  "Turn ON circulation fans when RH > 75%, OFF when <= 70%"},
+    {"humidity",    "circulation_fans",  0,     75.0,  "Turn ON circulation fans when RH > 75%, OFF when <= 70%"},
     {"moisture",    "pump",              60.0,  100,   "Run pump when moisture < 60%, stop when >= 65%"},
     {"light",       "grow_light",        10000, 99999, "Turn ON grow light when lux < 10,000"},
   };

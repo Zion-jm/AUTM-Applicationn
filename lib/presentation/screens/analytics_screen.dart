@@ -205,8 +205,45 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
       ),
       body: Consumer<AppState>(
         builder: (context, state, _) {
-          final reading = state.readings
-              .firstWhere((r) => r.id == _selectedSensor);
+          // ── Guard: no sensor data yet ──────────────────────
+          if (state.readings.isEmpty) {
+            return const Center(
+              child: Padding(
+                padding: EdgeInsets.all(40),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.sensors_off_outlined,
+                        color: AppTheme.inkFaint, size: 48),
+                    SizedBox(height: 16),
+                    Text(
+                      'No sensor data yet',
+                      style: TextStyle(
+                        color: AppTheme.textPrimary,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    SizedBox(height: 8),
+                    Text(
+                      'Connect your greenhouse device to see analytics.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: AppTheme.textMuted,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
+
+          // Safe: readings is non-empty from here on
+          final reading = state.readings.firstWhere(
+            (r) => r.id == _selectedSensor,
+            orElse: () => state.readings.first,
+          );
           final history = _history ?? state.historyFor(_selectedSensor);
           final filtered = _filterPoints(history.points);
           final color = statusColor(reading.status);
@@ -828,6 +865,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   }
 
   Widget _buildYAxisLabels(List<SensorDataPoint> points) {
+    if (points.isEmpty) return const SizedBox(width: 56);
     final values = points.map((p) => p.value).toList();
     final minV = values.reduce((a, b) => a < b ? a : b);
     final maxV = values.reduce((a, b) => a > b ? a : b);

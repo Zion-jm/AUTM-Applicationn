@@ -1,60 +1,214 @@
+//control_screen.dart
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:automato/domain/models/sensor_data.dart';
 import 'package:automato/presentation/providers/app_state.dart';
 import 'package:automato/presentation/theme/app_theme.dart';
-import 'package:automato/presentation/widgets/sensor_card.dart'; // To reuse FloatingCard
+import 'package:automato/presentation/widgets/sensor_card.dart';
 
 // ─────────────────────────────────────────────────────────────
-// CONTROL SCREEN — FLOATING MINIMALIST MODERN EDITION
+// CONTROL SCREEN - RELIABLE DEVICE CONTROL WITH PENDING STATE
 // ─────────────────────────────────────────────────────────────
 
-class ControlScreen extends StatelessWidget {
+class ControlScreen extends StatefulWidget {
   const ControlScreen({super.key});
+
+  @override
+  State<ControlScreen> createState() => _ControlScreenState();
+}
+
+class _ControlScreenState extends State<ControlScreen> {
+  bool _isLoading = false;
+  String? _loadingDeviceId;
+  DateTime? _lastTapTime;
+
+  /// Global lock: prevents ANY taps while processing
+  bool get _isGloballyLocked => _isLoading;
+
+  void _setLoading(String deviceId, bool loading) {
+    if (!mounted) return;
+    setState(() {
+      _isLoading = loading;
+      _loadingDeviceId = loading ? deviceId : null;
+    });
+  }
+
+  /// Debounced tap handler with global lock
+  Future<void> _handleDeviceTap(
+    String deviceId,
+    DeviceStatus status,
+    bool isOn,
+    AppState state,
+  ) async {
+    // 1. Global lock check
+    if (_isGloballyLocked) {
+      debugPrint('Tap blocked: global lock active for $_loadingDeviceId');
+      return;
+    }
+
+    // 2. Debounce: prevent rapid re-taps (300ms cooldown)
+    final now = DateTime.now();
+    if (_lastTapTime != null &&
+        now.difference(_lastTapTime!) < const Duration(milliseconds: 300)) {
+      debugPrint('Tap debounced');
+      return;
+    }
+    _lastTapTime = now;
+
+    _setLoading(deviceId, true);
+
+    try {
+      final success = await state.setDeviceStatus(deviceId, status, isOn);
+
+      if (!mounted) return;
+
+      if (!success) {
+        // Show error feedback
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Failed to switch ${state.devices.firstWhere((d) => d.id == deviceId).label}. Please try again.',
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            backgroundColor: AppTheme.statusAlert,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+            action: SnackBarAction(
+              label: 'RETRY',
+              textColor: Colors.white,
+              onPressed: () => _handleDeviceTap(deviceId, status, isOn, state),
+            ),
+          ),
+        );
+      } else {
+        // Brief success haptic/visual feedback
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    } finally {
+      if (mounted) _setLoading(deviceId, false);
+    }
+  }
+
+  Future<void> _handleEmergencyShutdown(AppState state) async {
+    if (_isGloballyLocked) return;
+
+    final now = DateTime.now();
+    if (_lastTapTime != null &&
+        now.difference(_lastTapTime!) < const Duration(milliseconds: 500)) {
+      return;
+    }
+    _lastTapTime = now;
+
+    _setLoading('emergency', true);
+
+    try {
+      await state.emergencyShutdown();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'EMERGENCY SHUTDOWN ACTIVATED - ALL RELAYS OFF',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          backgroundColor: AppTheme.statusAlert,
+          behavior: SnackBarBehavior.floating,
+          duration: Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Emergency shutdown failed: $e'),
+          backgroundColor: AppTheme.statusAlert,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } finally {
+      if (mounted) _setLoading('emergency', false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
 
-    return Scaffold(
-      backgroundColor: const Color(0xFFF4F2EE), // Matching warm concrete paper canvas background
-      body: SafeArea(
-        child: ListView(
-          physics: const BouncingScrollPhysics(),
-          padding: const EdgeInsets.fromLTRB(24, 24, 24, 40),
-          children: [
-            // ── Section 1: Device Control ───────────────────────────
-            _buildSectionHeader('Device Control'),
-            const SizedBox(height: 14),
+    return Stack(
+      children: [
+        Scaffold(
+          backgroundColor: const Color(0xFFF4F2EE),
+          body: SafeArea(
+            child: ListView(
+              physics: _isGloballyLocked
+                  ? const NeverScrollableScrollPhysics()
+                  : const BouncingScrollPhysics(),
+              padding: const EdgeInsets.fromLTRB(24, 24, 24, 40),
+              children: [
+                // ── Section 1: Device Control ───────────────────────────
+                _buildSectionHeader('Device Control'),
+                const SizedBox(height: 14),
 
-            ...state.devices.map((d) => Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: _DeviceCard(
-                    device: d,
-                    onStatusChanged: (status, isOn) =>
-                        state.setDeviceStatus(d.id, status, isOn),
-                  ),
-                )),
-            const SizedBox(height: 16),
+                ...state.devices.map((d) => Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: _DeviceCard(
+                        device: d,
+                        isLoading: _isLoading && _loadingDeviceId == d.id,
+                        isGloballyLocked: _isGloballyLocked,
+                        isPending: state.isDevicePending(d.id),
+                        pendingStatus: state.pendingStatusFor(d.id),
+                        onStatusChanged: (status, isOn) =>
+                            _handleDeviceTap(d.id, status, isOn, state),
+                      ),
+                    )),
+                const SizedBox(height: 16),
 
-            // ── Emergency Shutdown Button (Positioned below Device Control) ──
-            _buildEmergencyShutdownButton(context, state),
-            const SizedBox(height: 32),
+                // ── Emergency Shutdown Button ──
+                _buildEmergencyShutdownButton(context, state),
+                const SizedBox(height: 32),
 
-            // ── Section 2: Automation Rules ─────────────────────────
-            _buildSectionHeader('Automation Rules'),
-            const SizedBox(height: 14),
+                // ── Section 2: Automation Rules ─────────────────────────
+                _buildSectionHeader('Automation Rules'),
+                const SizedBox(height: 14),
 
-            ...state.automationRules.map((rule) => Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: _RuleCard(
-                    rule: rule,
-                    readings: state.readings,
-                  ),
-                )),
-          ],
+                ...state.automationRules.map((rule) => Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: _RuleCard(
+                        rule: rule,
+                        readings: state.readings,
+                      ),
+                    )),
+              ],
+            ),
+          ),
         ),
-      ),
+
+        // Loading overlay (blocks entire screen)
+        if (_isGloballyLocked)
+          Container(
+            color: Colors.black.withOpacity(0.25),
+            child: const Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(
+                    color: Color(0xFF132F28),
+                    strokeWidth: 3,
+                  ),
+                  SizedBox(height: 16),
+                  Text(
+                    'Sending command...',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
     );
   }
 
@@ -70,16 +224,16 @@ class ControlScreen extends StatelessWidget {
     );
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // EMERGENCY SHUTDOWN BUTTON — TACTICAL SAFETY FEATURE
-  // ═══════════════════════════════════════════════════════════
   Widget _buildEmergencyShutdownButton(BuildContext context, AppState state) {
-    // Check if any device is currently active to highlight potential safety shutoffs
     final activeDevicesCount = state.devices.where((d) => d.isOn).length;
+    final isEmergencyLoading = _isLoading && _loadingDeviceId == 'emergency';
+    final isDisabled = _isGloballyLocked && !isEmergencyLoading;
 
     return FloatingCard(
-      onTap: () => _showShutdownConfirmation(context, state),
-      backgroundColor: const Color(0xFFFAEAEA), // Extremely soft warning rose
+      onTap: isDisabled ? null : () => _showShutdownConfirmation(context, state),
+      backgroundColor: isEmergencyLoading
+          ? const Color(0xFFE8D5D5)
+          : const Color(0xFFFAEAEA),
       borderRadius: 8,
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -87,22 +241,33 @@ class ControlScreen extends StatelessWidget {
           children: [
             Container(
               padding: const EdgeInsets.all(10),
-              decoration: const BoxDecoration(
-                color: Color(0xFFF5D4D4),
+              decoration: BoxDecoration(
+                color: isEmergencyLoading
+                    ? const Color(0xFFE0C0C0)
+                    : const Color(0xFFF5D4D4),
                 shape: BoxShape.circle,
               ),
-              child: const Icon(
-                Icons.power_settings_new_rounded,
-                color: AppTheme.statusAlert,
-                size: 24,
-              ),
+              child: isEmergencyLoading
+                  ? const SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: AppTheme.statusAlert,
+                      ),
+                    )
+                  : const Icon(
+                      Icons.power_settings_new_rounded,
+                      color: AppTheme.statusAlert,
+                      size: 24,
+                    ),
             ),
             const SizedBox(width: 14),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
+                  Text(
                     'EMERGENCY SHUTDOWN',
                     style: TextStyle(
                       color: AppTheme.statusAlert,
@@ -136,10 +301,10 @@ class ControlScreen extends StatelessWidget {
     );
   }
 
-  // Display a premium custom confirmation dialog to prevent accidental triggers
   void _showShutdownConfirmation(BuildContext context, AppState state) {
     showDialog(
       context: context,
+      barrierDismissible: false,
       builder: (context) {
         return AlertDialog(
           backgroundColor: Colors.white,
@@ -161,27 +326,19 @@ class ControlScreen extends StatelessWidget {
           actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: _isGloballyLocked ? null : () => Navigator.pop(context),
               child: const Text(
                 'Cancel',
                 style: TextStyle(color: AppTheme.inkFaint, fontWeight: FontWeight.bold),
               ),
             ),
             ElevatedButton(
-              onPressed: () {
-                // Loop through and force shutdown all connected IoT actuators
-                for (final device in state.devices) {
-                  state.setDeviceStatus(device.id, DeviceStatus.manualOff, false);
-                }
-                Navigator.pop(context);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('EMERGENCY SHUTDOWN ACTIVATED - ALL RELAYS OFF'),
-                    backgroundColor: AppTheme.statusAlert,
-                    behavior: SnackBarBehavior.floating,
-                  ),
-                );
-              },
+              onPressed: _isGloballyLocked
+                  ? null
+                  : () async {
+                      Navigator.pop(context);
+                      await _handleEmergencyShutdown(state);
+                    },
               style: ElevatedButton.styleFrom(
                 backgroundColor: AppTheme.statusAlert,
                 foregroundColor: Colors.white,
@@ -202,17 +359,29 @@ class ControlScreen extends StatelessWidget {
 // ── DEVICE CARD ──────────────────────────────────────────────
 class _DeviceCard extends StatelessWidget {
   final DeviceState device;
+  final bool isLoading;
+  final bool isGloballyLocked;
+  final bool isPending;
+  final DeviceStatus? pendingStatus;
   final void Function(DeviceStatus, bool) onStatusChanged;
 
   const _DeviceCard({
     required this.device,
+    required this.isLoading,
+    required this.isGloballyLocked,
+    required this.isPending,
+    required this.pendingStatus,
     required this.onStatusChanged,
   });
 
   @override
   Widget build(BuildContext context) {
     final isOn = device.isOn;
-    final activeColor = isOn ? const Color(0xFF132F28) : AppTheme.inkFaint;
+    final isDisabled = isGloballyLocked && !isLoading;
+
+    // Show pending state visually
+    final bool showPending = isPending;
+    final DeviceStatus displayStatus = pendingStatus ?? device.status;
 
     return FloatingCard(
       backgroundColor: Colors.white,
@@ -228,14 +397,27 @@ class _DeviceCard extends StatelessWidget {
                   width: 42,
                   height: 40,
                   decoration: BoxDecoration(
-                    color: isOn ? const Color(0xFFEAEFE4) : const Color(0xFFF4F2EE),
+                    color: isOn && !showPending
+                        ? const Color(0xFFEAEFE4)
+                        : const Color(0xFFF4F2EE),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: Icon(
-                    _iconData(device.icon),
-                    color: isOn ? AppTheme.statusNormal : AppTheme.inkFaint,
-                    size: 20,
-                  ),
+                  child: isLoading || showPending
+                      ? const Center(
+                          child: SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Color(0xFF132F28),
+                            ),
+                          ),
+                        )
+                      : Icon(
+                          _iconData(device.icon),
+                          color: isOn ? AppTheme.statusNormal : AppTheme.inkFaint,
+                          size: 20,
+                        ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -250,7 +432,16 @@ class _DeviceCard extends StatelessWidget {
                           fontWeight: FontWeight.w800,
                         ),
                       ),
-                      if (device.triggerReason != null) ...[
+                      if (showPending)
+                        const Text(
+                          'Syncing...',
+                          style: TextStyle(
+                            color: AppTheme.inkFaint,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        )
+                      else if (device.triggerReason != null) ...[
                         const SizedBox(height: 2),
                         Text(
                           device.triggerReason!,
@@ -267,13 +458,17 @@ class _DeviceCard extends StatelessWidget {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                   decoration: BoxDecoration(
-                    color: isOn ? const Color(0xFFEAEFE4) : const Color(0xFFF4F2EE),
+                    color: showPending
+                        ? const Color(0xFFE8E8E8)
+                        : (isOn ? const Color(0xFFEAEFE4) : const Color(0xFFF4F2EE)),
                     borderRadius: BorderRadius.circular(20),
                   ),
                   child: Text(
-                    isOn ? 'ACTIVE' : 'OFF',
+                    showPending ? 'SYNCING' : (isOn ? 'ACTIVE' : 'OFF'),
                     style: TextStyle(
-                      color: isOn ? AppTheme.statusNormal : AppTheme.inkFaint,
+                      color: showPending
+                          ? AppTheme.inkFaint
+                          : (isOn ? AppTheme.statusNormal : AppTheme.inkFaint),
                       fontSize: 10,
                       fontWeight: FontWeight.w900,
                       letterSpacing: 0.5,
@@ -284,13 +479,15 @@ class _DeviceCard extends StatelessWidget {
             ),
             const SizedBox(height: 16),
 
-            // Row 2: Tactile Segmented Mode Selector Chips (Pill styled, no borders)
+            // Row 2: Mode Selector Chips
             Row(
               children: [
                 Expanded(
                   child: _ModeChip(
                     label: 'AUTO',
-                    selected: device.status == DeviceStatus.auto,
+                    selected: displayStatus == DeviceStatus.auto,
+                    isLoading: isLoading,
+                    isDisabled: isDisabled || showPending,
                     onTap: () => onStatusChanged(DeviceStatus.auto, isOn),
                   ),
                 ),
@@ -298,8 +495,10 @@ class _DeviceCard extends StatelessWidget {
                 Expanded(
                   child: _ModeChip(
                     label: 'ON',
-                    selected: device.status == DeviceStatus.manualOn,
+                    selected: displayStatus == DeviceStatus.manualOn,
                     color: AppTheme.statusNormal,
+                    isLoading: isLoading,
+                    isDisabled: isDisabled || showPending,
                     onTap: () => onStatusChanged(DeviceStatus.manualOn, true),
                   ),
                 ),
@@ -307,16 +506,17 @@ class _DeviceCard extends StatelessWidget {
                 Expanded(
                   child: _ModeChip(
                     label: 'OFF',
-                    selected: device.status == DeviceStatus.manualOff,
+                    selected: displayStatus == DeviceStatus.manualOff,
                     color: AppTheme.statusAlert,
+                    isLoading: isLoading,
+                    isDisabled: isDisabled || showPending,
                     onTap: () => onStatusChanged(DeviceStatus.manualOff, false),
                   ),
                 ),
               ],
             ),
 
-            // Optional last triggered timestamp strip
-            if (device.lastTriggered != null) ...[
+            if (device.lastTriggered != null && !showPending) ...[
               const SizedBox(height: 12),
               Row(
                 children: [
@@ -366,40 +566,60 @@ class _DeviceCard extends StatelessWidget {
   }
 }
 
-// ── MODE CHIP (Pill Segmented Style) ──────────────────────────
+// ── MODE CHIP ─────────────────────────────────────────────────
 class _ModeChip extends StatelessWidget {
   final String label;
   final bool selected;
   final Color? color;
+  final bool isLoading;
+  final bool isDisabled;
   final VoidCallback onTap;
 
   const _ModeChip({
     required this.label,
     required this.selected,
     this.color,
+    required this.isLoading,
+    required this.isDisabled,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
     final c = color ?? const Color(0xFF132F28);
-    return GestureDetector(
-      onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 100),
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected ? c.withOpacity(0.12) : const Color(0xFFF4F2EE),
-          borderRadius: BorderRadius.circular(20), // Premium pill shapes
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected ? c : AppTheme.inkFaint,
-            fontSize: 11,
-            fontWeight: FontWeight.w900,
-            letterSpacing: 0.5,
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: (isLoading || isDisabled) ? null : onTap,
+        borderRadius: BorderRadius.circular(20),
+        child: Ink(
+          decoration: BoxDecoration(
+            color: selected ? c.withOpacity(0.12) : const Color(0xFFF4F2EE),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Center(
+            child: isLoading && selected
+                ? SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: c,
+                    ),
+                  )
+                : Text(
+                    label,
+                    style: TextStyle(
+                      color: isDisabled
+                          ? AppTheme.inkFaint.withOpacity(0.4)
+                          : (selected ? c : AppTheme.inkFaint),
+                      fontSize: 11,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
           ),
         ),
       ),
@@ -419,9 +639,7 @@ class _RuleCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final sensor = readings
-        .where((r) => r.id == rule.sensorId)
-        .firstOrNull;
+    final sensor = readings.where((r) => r.id == rule.sensorId).firstOrNull;
     final isTriggered =
         sensor != null && sensor.status != SensorStatus.normal;
 

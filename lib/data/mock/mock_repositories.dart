@@ -490,5 +490,11 @@ class MockAuthRepository implements AuthRepository {
   }
 
   @override
+  Future<bool> signUp(String email, String password) async {
+    // Mock always succeeds
+    return true;
+  }
+
+  @override
   void dispose() {}
 }

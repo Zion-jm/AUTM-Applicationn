@@ -1,0 +1,76 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "history": {
+      ".read": "auth != null",
+      ".write": true,
+      "$sensorId": {
+        ".indexOn": ["timestamp"]
+      }
+    },
+
+    "alerts": {
+      ".read": "auth != null",
+      ".write": true,
+      ".indexOn": ["createdAt"]
+    },
+
+    "devices": {
+      ".read": "auth != null",
+      ".write": true,
+      ".indexOn": ["lastTriggered"]
+    },
+
+    "commands": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+
+    "config": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+
+    "captures": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+
+    "sensors": {
+      ".read": "auth != null",
+      ".write": true
+    },
+
+    "system": {
+      ".read": "auth != null",
+      ".write": true
+    },
+
+    "greenhouses": {
+      ".indexOn": ["joinCode"],
+      "$greenhouseId": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
+    },
+
+    "joinCodes": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+
+    "inviteCodes": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+
+    "users": {
+      "$userId": {
+        ".read": "auth != null && auth.uid == $userId",
+        ".write": "auth != null && auth.uid == $userId"
+      }
+    }
+  }
+}

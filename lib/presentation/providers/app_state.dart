@@ -1,4 +1,4 @@
-//app_state.dart
+// app_state.dart
 
 import 'dart:async';
 import 'dart:io';
@@ -14,6 +14,22 @@ import '../../services/notification_service.dart';
 import '../../services/google_drive_service.dart';
 import '../../services/vision_service.dart';
 import '../../services/aigrowth_analyzer.dart';
+import 'package:collection/collection.dart';
+
+// ── Pending command helper (top-level, not inside AppState) ──
+class _PendingCommand {
+  final String deviceId;
+  final DeviceStatus targetStatus;
+  final bool targetIsOn;
+  final DateTime issuedAt;
+
+  _PendingCommand({
+    required this.deviceId,
+    required this.targetStatus,
+    required this.targetIsOn,
+    required this.issuedAt,
+  });
+}
 
 class AppState extends ChangeNotifier {
   final SensorRepository _sensorRepo;
@@ -472,10 +488,192 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  // ── Devices ──────────────────────────────────────────────────
-  void setDeviceStatus(String deviceId, DeviceStatus status, bool isOn) {
-    _deviceRepo.setDeviceStatus(deviceId, status, isOn);
+  // ════════════════════════════════════════════════════════════
+  // DEVICES — RELIABLE: Sync UI to ESP32-reported hardware state
+  // ════════════════════════════════════════════════════════════
+
+  // Track pending commands: deviceId -> {status, mode, targetState, issuedAt}
+  final Map<String, _PendingCommand> _pendingCommands = {};
+
+  /// True if any device command is currently in-flight
+  bool get isAnyDevicePending => _pendingCommands.isNotEmpty;
+
+  /// Check if a specific device has a pending command
+  bool isDevicePending(String deviceId) => _pendingCommands.containsKey(deviceId);
+
+  /// Get the pending mode for a device (for UI display during transition)
+  DeviceStatus? pendingStatusFor(String deviceId) =>
+      _pendingCommands[deviceId]?.targetStatus;
+
+  /// Send device command to ESP32 via Firebase — UI follows hardware, not local
+  Future<bool> setDeviceStatus(String deviceId, DeviceStatus status, bool isOn) async {
+    // 1. Prevent duplicate commands while one is pending
+    if (_pendingCommands.containsKey(deviceId)) {
+      debugPrint('Command blocked: $deviceId already has pending command');
+      return false;
+    }
+
+    // 2. Build command payload
+    final modeStr = status == DeviceStatus.manualOn
+        ? 'manual_on'
+        : status == DeviceStatus.manualOff
+            ? 'manual_off'
+            : 'auto';
+
+    final commandData = {
+      'status': 'pending',
+      'mode': modeStr,
+      'targetState': isOn,
+      'timestamp': ServerValue.timestamp,
+      'issuedBy': 'flutter_app',
+    };
+
+    // 3. Mark as pending (UI shows loading/spinner, not the new state yet)
+    _pendingCommands[deviceId] = _PendingCommand(
+      deviceId: deviceId,
+      targetStatus: status,
+      targetIsOn: isOn,
+      issuedAt: DateTime.now(),
+    );
+    notifyListeners();
+
+    try {
+      // 4. Write to Firebase
+      await _db.child('commands/$deviceId').set(commandData).timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => throw TimeoutException('Firebase command timeout'),
+      );
+
+      debugPrint('Command sent: $deviceId -> $modeStr ($isOn)');
+
+      // 5. Wait for ESP32 to process AND update /devices (max 5s)
+      final success = await _waitForDeviceSync(deviceId, status, isOn, timeoutMs: 5000);
+
+      // 6. Clear pending regardless of outcome
+      _pendingCommands.remove(deviceId);
+      notifyListeners();
+
+      if (!success) {
+        debugPrint('Device sync timeout for $deviceId — ESP32 did not confirm');
+        return false;
+      }
+
+      debugPrint('Device synced: $deviceId is now $modeStr');
+      return true;
+
+    } catch (e) {
+      debugPrint('Command failed for $deviceId: $e');
+      _pendingCommands.remove(deviceId);
+      notifyListeners();
+      return false;
+    }
   }
+
+  /// Wait until ESP32 reports the matching state in /devices/{id}
+  Future<bool> _waitForDeviceSync(
+    String deviceId,
+    DeviceStatus expectedStatus,
+    bool expectedIsOn, {
+    required int timeoutMs,
+  }) async {
+    final completer = Completer<bool>();
+    late StreamSubscription<DatabaseEvent> sub;
+    Timer? timer;
+
+    // Check if already matching (ESP32 might be fast)
+    final currentDevice = _devices.firstWhereOrNull((d) => d.id == deviceId);
+    if (currentDevice != null &&
+        currentDevice.status == expectedStatus &&
+        currentDevice.isOn == expectedIsOn) {
+      return true;
+    }
+
+    timer = Timer(Duration(milliseconds: timeoutMs), () {
+      sub.cancel();
+      if (!completer.isCompleted) completer.complete(false);
+    });
+
+    sub = _db.child('devices/$deviceId').onValue.listen((event) {
+      if (event.snapshot.value == null) return;
+
+      final data = event.snapshot.value as Map<dynamic, dynamic>;
+      final modeStr = data['mode'] as String? ?? 'auto';
+      final isOn = data['isOn'] as bool? ?? false;
+
+      final actualStatus = _parseDeviceStatus(modeStr);
+
+      if (actualStatus == expectedStatus && isOn == expectedIsOn) {
+        timer?.cancel();
+        sub.cancel();
+        if (!completer.isCompleted) completer.complete(true);
+      }
+    });
+
+    return completer.future;
+  }
+
+  static DeviceStatus _parseDeviceStatus(String? modeStr) {
+    switch (modeStr) {
+      case 'manual_on':
+        return DeviceStatus.manualOn;
+      case 'manual_off':
+        return DeviceStatus.manualOff;
+      default:
+        return DeviceStatus.auto;
+    }
+  }
+
+  /// Emergency shutdown — sends OFF to all, waits for all to confirm
+  Future<void> emergencyShutdown() async {
+    final batch = <String, dynamic>{};
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    // Mark all as pending
+    for (final device in _devices) {
+      _pendingCommands[device.id] = _PendingCommand(
+        deviceId: device.id,
+        targetStatus: DeviceStatus.manualOff,
+        targetIsOn: false,
+        issuedAt: DateTime.now(),
+      );
+
+      batch['commands/${device.id}'] = {
+        'status': 'pending',
+        'mode': 'manual_off',
+        'targetState': false,
+        'timestamp': now,
+        'issuedBy': 'flutter_app',
+      };
+    }
+
+    notifyListeners();
+
+    try {
+      await _db.update(batch).timeout(
+        const Duration(seconds: 8),
+        onTimeout: () => throw TimeoutException('Emergency shutdown timeout'),
+      );
+
+      // Wait for all devices to report OFF
+      final futures = _devices.map((d) =>
+        _waitForDeviceSync(d.id, DeviceStatus.manualOff, false, timeoutMs: 5000),
+      );
+      await Future.wait(futures);
+
+      _pendingCommands.clear();
+      notifyListeners();
+
+      debugPrint('Emergency shutdown complete — all devices confirmed OFF');
+
+    } catch (e) {
+      debugPrint('Emergency shutdown failed: $e');
+      _pendingCommands.clear();
+      notifyListeners();
+      rethrow;
+    }
+  }
+
+
 
   // ── Camera ───────────────────────────────────────────────────
   PlantSnapshot triggerManualCapture() {
@@ -714,7 +912,7 @@ class AppState extends ChangeNotifier {
 
       // 3. Run Cloud Vision analysis
       final visionResult = await _visionService.analyzePlantImage(imageBytes);
-      debugPrint('🔍 Vision labels: ${visionResult.labels.take(5).join(', ')}');
+      debugPrint("🔍 Vision labels: ${visionResult.labels.take(5).join(", ")}");
 
       // 4. Gather current sensor readings for fusion
       final currentReadings = <String, double>{};

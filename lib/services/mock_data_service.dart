@@ -149,12 +149,12 @@ class MockDataService {
     }).toList();
   }
 
-  List<AutomationRule> get automationRules => [
-        AutomationRule(sensorId: 'temperature', deviceId: 'exhaust_fan',       triggerLow: 0,     triggerHigh: 28.0,  actionDescription: 'Turn ON exhaust fan when temp > 28°C, OFF when ≤ 26°C'),
-        AutomationRule(sensorId: 'humidity',    deviceId: 'circulation_fan_1', triggerLow: 0,     triggerHigh: 75.0,  actionDescription: 'Turn ON circulation fans when RH > 75%, OFF when ≤ 70%'),
-        AutomationRule(sensorId: 'moisture',    deviceId: 'pump',              triggerLow: 60.0,  triggerHigh: 100,   actionDescription: 'Run pump for 2 min when moisture < 60%'),
-        AutomationRule(sensorId: 'light',       deviceId: 'grow_light',        triggerLow: 10000, triggerHigh: 99999, actionDescription: 'Turn ON grow light when lux < 10,000 (6AM–6PM)'),
-      ];
+  //List<AutomationRule> get automationRules => [
+  //      AutomationRule(sensorId: 'temperature', deviceId: 'exhaust_fan',       triggerLow: 0,     triggerHigh: 28.0,  actionDescription: 'Turn ON exhaust fan when temp > 28°C, OFF when ≤ 26°C'),
+  //      AutomationRule(sensorId: 'humidity',    deviceId: 'circulation_fan_1', triggerLow: 0,     triggerHigh: 75.0,  actionDescription: 'Turn ON circulation fans when RH > 75%, OFF when ≤ 70%'),
+  //      AutomationRule(sensorId: 'moisture',    deviceId: 'pump',              triggerLow: 60.0,  triggerHigh: 100,   actionDescription: 'Run pump for 2 min when moisture < 60%'),
+  //      AutomationRule(sensorId: 'light',       deviceId: 'grow_light',        triggerLow: 10000, triggerHigh: 99999, actionDescription: 'Turn ON grow light when lux < 10,000 (6AM–6PM)'),
+  //    ];
 
   // ─────────────────────────────────────────────────────────────
   // ALERTS

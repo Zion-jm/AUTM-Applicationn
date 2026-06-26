@@ -91,6 +91,8 @@ abstract class AuthRepository {
   /// Attempt sign-in with [email] and [password].
   /// Returns `true` on success, throws on failure.
   Future<bool> signIn(String email, String password);
+  Future<bool> signUp(String email, String password);
+
 
   void dispose();
 }
